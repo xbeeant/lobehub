@@ -1,0 +1,902 @@
+diff --git a/.vscode/settings.json b/.vscode/settings.json
+index 32d587d49..86422153c 100644
+--- a/.vscode/settings.json
++++ b/.vscode/settings.json
+@@ -7,9 +7,18 @@
+   "editor.formatOnSave": true,
+   // don't show errors, but fix when save and git pre commit
+   "eslint.rules.customizations": [
+-    { "rule": "simple-import-sort/exports", "severity": "off" },
+-    { "rule": "perfectionist/sort-interfaces", "severity": "off" },
+-    { "rule": "simple-import-sort/imports", "severity": "off" }
++    {
++      "rule": "simple-import-sort/exports",
++      "severity": "off"
++    },
++    {
++      "rule": "perfectionist/sort-interfaces",
++      "severity": "off"
++    },
++    {
++      "rule": "simple-import-sort/imports",
++      "severity": "off"
++    }
+   ],
+   "eslint.validate": [
+     "json",
+@@ -92,4 +101,4 @@
+     "**/src/locales/default/*.ts": "${filename} • locale",
+     "**/index.*": "${dirname}/${filename}.${extname}"
+   }
+-}
++}
+\ No newline at end of file
+diff --git a/src/app/(backend)/middleware/auth/index.ts b/src/app/(backend)/middleware/auth/index.ts
+index 376ab6967..71ea1807d 100644
+--- a/src/app/(backend)/middleware/auth/index.ts
++++ b/src/app/(backend)/middleware/auth/index.ts
+@@ -11,6 +11,7 @@ import { LOBE_CHAT_OIDC_AUTH_HEADER } from '@/envs/auth';
+ import { extractTraceContext, injectActiveTraceHeaders } from '@/libs/observability/traceparent';
+ import { assertOIDCUserActive } from '@/libs/oidc-provider/access-control';
+ import { validateOIDCJWT } from '@/libs/oidc-provider/jwt';
++import { TokenAuthService } from '@/server/services/tokenAuth';
+ import { createErrorResponse } from '@/utils/errorResponse';
+ 
+ type RequestOptions = { params: Promise<{ provider?: string }> };
+@@ -82,6 +83,7 @@ export const checkAuth =
+     }
+ 
+     let userId: string;
++    let sessionCookie: string | null = null;
+ 
+     try {
+       // OIDC authentication (CLI)
+@@ -121,32 +123,98 @@ export const checkAuth =
+         });
+       }
+ 
+-      // if the error is not a ChatCompletionErrorPayload, it means the application error
+-      if (!(e as ChatCompletionErrorPayload).errorType) {
+-        if (isUnauthorizedAuthError(e)) {
+-          return createErrorResponse(ChatErrorType.Unauthorized, {
++      // Try token authentication from cookie if Better Auth session not found
++      if (!oidcAuthorization && TokenAuthService.isTokenAuthEnabled()) {
++        const cookieHeader = req.headers.get('cookie');
++        const cookieToken = TokenAuthService.extractTokenFromCookie(cookieHeader);
++
++        if (cookieToken) {
++          try {
++            const clientIp = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
++              req.headers.get('x-real-ip')?.trim() || undefined;
++            const userAgent = req.headers.get('user-agent') || undefined;
++
++            const tokenAuthService = new TokenAuthService(serverDB);
++            const tokenAuthResult = await tokenAuthService.authenticateWithToken(
++              cookieToken,
++              clientIp,
++              userAgent,
++            );
++
++            if (tokenAuthResult) {
++              userId = tokenAuthResult.userId;
++              sessionCookie = tokenAuthResult.sessionToken;
++              // Continue to handler with authenticated user
++            } else {
++              // Token verification failed, return unauthorized
++              return createErrorResponse(ChatErrorType.Unauthorized, {
++                error: e,
++                provider: params?.provider,
++              });
++            }
++          } catch (tokenError) {
++            console.error('[auth] Token authentication failed:', tokenError);
++            return createErrorResponse(ChatErrorType.Unauthorized, {
++              error: e,
++              provider: params?.provider,
++            });
++          }
++        } else {
++          // if the error is not a ChatCompletionErrorPayload, it means the application error
++          if (!(e as ChatCompletionErrorPayload).errorType) {
++            if (isUnauthorizedAuthError(e)) {
++              return createErrorResponse(ChatErrorType.Unauthorized, {
++                error: e,
++                provider: params?.provider,
++              });
++            }
++
++            // other issue will be internal server error
++            console.error(e);
++            return createErrorResponse(ChatErrorType.InternalServerError, {
++              error: e,
++              provider: params?.provider,
++            });
++          }
++
++          const {
++            errorType = ChatErrorType.InternalServerError,
++            error: errorContent,
++            ...res
++          } = e as ChatCompletionErrorPayload;
++
++          const error = errorContent || e;
++
++          return createErrorResponse(errorType, { error, ...res, provider: params?.provider });
++        }
++      } else {
++        // if the error is not a ChatCompletionErrorPayload, it means the application error
++        if (!(e as ChatCompletionErrorPayload).errorType) {
++          if (isUnauthorizedAuthError(e)) {
++            return createErrorResponse(ChatErrorType.Unauthorized, {
++              error: e,
++              provider: params?.provider,
++            });
++          }
++
++          // other issue will be internal server error
++          console.error(e);
++          return createErrorResponse(ChatErrorType.InternalServerError, {
+             error: e,
+             provider: params?.provider,
+           });
+         }
+ 
+-        // other issue will be internal server error
+-        console.error(e);
+-        return createErrorResponse(ChatErrorType.InternalServerError, {
+-          error: e,
+-          provider: params?.provider,
+-        });
+-      }
+-
+-      const {
+-        errorType = ChatErrorType.InternalServerError,
+-        error: errorContent,
+-        ...res
+-      } = e as ChatCompletionErrorPayload;
++        const {
++          errorType = ChatErrorType.InternalServerError,
++          error: errorContent,
++          ...res
++        } = e as ChatCompletionErrorPayload;
+ 
+-      const error = errorContent || e;
++        const error = errorContent || e;
+ 
+-      return createErrorResponse(errorType, { error, ...res, provider: params?.provider });
++        return createErrorResponse(errorType, { error, ...res, provider: params?.provider });
++      }
+     }
+ 
+     const jwtPayload: ClientSecretPayload = { userId };
+@@ -169,6 +237,15 @@ export const checkAuth =
+     try {
+       const headers = new Headers(res.headers);
+       const traceparent = injectActiveTraceHeaders(headers);
++
++      // Set session cookie if token authentication was used
++      if (sessionCookie) {
++        headers.append(
++          'Set-Cookie',
++          `better-auth.session_token=${sessionCookie}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${7 * 24 * 60 * 60}`,
++        );
++      }
++
+       if (!traceparent) {
+         return res;
+       }
+diff --git a/src/envs/auth.ts b/src/envs/auth.ts
+index 422fe85c8..727dcc85d 100644
+--- a/src/envs/auth.ts
++++ b/src/envs/auth.ts
+@@ -74,13 +74,59 @@ declare global {
+       // ===== Better Auth ===== //
+       AUTH_SECRET?: string;
+       AUTH_SSO_PROVIDERS?: string;
++      // ===== Token Cookie Authentication ===== //
++      /**
++       * Cookie key for token authentication.
++       * When user is not logged in but this cookie exists, the token will be used
++       * to call AUTH_TOKEN_VERIFY_URL to verify and get user info.
++       * @default 'token'
++       */
++      AUTH_TOKEN_COOKIE_KEY?: string;
++
++      /**
++       * Default email domain for generating email when user info doesn't contain email.
++       * When email is not provided, it will be generated as: name@AUTH_TOKEN_DEFAULT_EMAIL_DOMAIN
++       * @default 'lobehub.com'
++       */
++      AUTH_TOKEN_DEFAULT_EMAIL_DOMAIN?: string;
++
++      /**
++       * Key path for extracting user email from token verification API response.
++       * Supports nested keys using dot notation (e.g., 'data.user.email').
++       * @default 'email'
++       */
++      AUTH_TOKEN_USER_INFO_EMAIL_KEY?: string;
++
++      /**
++       * Key path for extracting user ID from token verification API response.
++       * Supports nested keys using dot notation (e.g., 'data.user.id').
++       * @default 'id'
++       */
++      AUTH_TOKEN_USER_INFO_ID_KEY?: string;
++
++      /**
++       * Key path for extracting user name from token verification API response.
++       * Supports nested keys using dot notation (e.g., 'data.user.name').
++       * @default 'name'
++       */
++      AUTH_TOKEN_USER_INFO_NAME_KEY?: string;
++
++      /**
++       * URL for token verification API.
++       * When set, tokens from AUTH_TOKEN_COOKIE_KEY cookie will be sent to this URL
++       * to verify and retrieve user information.
++       * The token will be sent as Bearer token in Authorization header.
++       */
++      AUTH_TOKEN_VERIFY_URL?: string;
++
+       AUTH_TRUSTED_ORIGINS?: string;
+ 
+       AUTH_WECHAT_ID?: string;
+       AUTH_WECHAT_SECRET?: string;
+-
+       AUTH_ZITADEL_ID?: string;
++
+       AUTH_ZITADEL_ISSUER?: string;
++
+       AUTH_ZITADEL_SECRET?: string;
+ 
+       /**
+@@ -196,6 +242,14 @@ export const getAuthConfig = () => {
+ 
+       // Internal JWT expiration time (e.g., '10s', '1m', '1h')
+       INTERNAL_JWT_EXPIRATION: z.string().default('30s'),
++
++      // Token cookie authentication
++      AUTH_TOKEN_COOKIE_KEY: z.string().optional().default('token'),
++      AUTH_TOKEN_VERIFY_URL: z.string().optional(),
++      AUTH_TOKEN_USER_INFO_ID_KEY: z.string().optional().default('id'),
++      AUTH_TOKEN_USER_INFO_EMAIL_KEY: z.string().optional().default('email'),
++      AUTH_TOKEN_USER_INFO_NAME_KEY: z.string().optional().default('name'),
++      AUTH_TOKEN_DEFAULT_EMAIL_DOMAIN: z.string().optional().default('lobehub.com'),
+     },
+ 
+     runtimeEnv: {
+@@ -289,6 +343,14 @@ export const getAuthConfig = () => {
+ 
+       // Internal JWT expiration time
+       INTERNAL_JWT_EXPIRATION: process.env.INTERNAL_JWT_EXPIRATION,
++
++      // Token cookie authentication
++      AUTH_TOKEN_COOKIE_KEY: process.env.AUTH_TOKEN_COOKIE_KEY,
++      AUTH_TOKEN_VERIFY_URL: process.env.AUTH_TOKEN_VERIFY_URL,
++      AUTH_TOKEN_USER_INFO_ID_KEY: process.env.AUTH_TOKEN_USER_INFO_ID_KEY,
++      AUTH_TOKEN_USER_INFO_EMAIL_KEY: process.env.AUTH_TOKEN_USER_INFO_EMAIL_KEY,
++      AUTH_TOKEN_USER_INFO_NAME_KEY: process.env.AUTH_TOKEN_USER_INFO_NAME_KEY,
++      AUTH_TOKEN_DEFAULT_EMAIL_DOMAIN: process.env.AUTH_TOKEN_DEFAULT_EMAIL_DOMAIN,
+     },
+   });
+ };
+diff --git a/src/libs/trpc/lambda/context.ts b/src/libs/trpc/lambda/context.ts
+index ba1707fd6..7424a357a 100644
+--- a/src/libs/trpc/lambda/context.ts
++++ b/src/libs/trpc/lambda/context.ts
+@@ -11,6 +11,7 @@ import { authEnv, LOBE_CHAT_OIDC_AUTH_HEADER } from '@/envs/auth';
+ import { extractTraceContext } from '@/libs/observability/traceparent';
+ import { assertOIDCUserActive, isOIDCUserInactiveError } from '@/libs/oidc-provider/access-control';
+ import { validateOIDCJWT } from '@/libs/oidc-provider/jwt';
++import { TokenAuthService } from '@/server/services/tokenAuth';
+ import { isApiKeyExpired, validateApiKeyFormat } from '@/utils/apiKey';
+ 
+ // Create context logger namespace
+@@ -84,12 +85,13 @@ export const createContextInner = async (params?: {
+   clientIp?: string | null;
+   marketAccessToken?: string;
+   oidcAuth?: OIDCAuth | null;
++  resHeaders?: Headers;
+   traceContext?: OtContext;
+   userAgent?: string;
+   userId?: string | null;
+ }): Promise<AuthContext> => {
+   log('createContextInner called with params: %O', params);
+-  const responseHeaders = new Headers();
++  const responseHeaders = params?.resHeaders || new Headers();
+ 
+   return {
+     clientIp: params?.clientIp,
+@@ -242,6 +244,52 @@ export const createLambdaContext = async (request: NextRequest): Promise<LambdaC
+     console.error('better auth err', e);
+   }
+ 
++  // Try token authentication from cookie if Better Auth session not found
++  if (TokenAuthService.isTokenAuthEnabled()) {
++    log('Token authentication enabled, attempting token auth from cookie');
++    const cookieToken = TokenAuthService.extractTokenFromCookie(cookieHeader);
++
++    if (cookieToken) {
++      log('Found token in cookie, attempting verification');
++      try {
++        const db = await getServerDB();
++        const tokenAuthService = new TokenAuthService(db);
++        const tokenAuthResult = await tokenAuthService.authenticateWithToken(
++          cookieToken,
++          clientIp,
++          userAgent,
++        );
++
++        if (tokenAuthResult) {
++          userId = tokenAuthResult.userId;
++          log('Token authentication successful, userId: %s', userId);
++
++          // Set session cookie in response headers
++          // Better Auth expects the session token in a cookie named 'better-auth.session_token'
++          const responseHeaders = new Headers();
++          responseHeaders.append(
++            'Set-Cookie',
++            `better-auth.session_token=${tokenAuthResult.sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${7 * 24 * 60 * 60}`,
++          );
++
++          return createContextInner({
++            ...commonContext,
++            resHeaders: responseHeaders,
++            traceContext,
++            userId,
++          });
++        } else {
++          log('Token verification failed, no user info returned');
++        }
++      } catch (error) {
++        log('Token authentication error: %O', error);
++        console.error('Token authentication failed:', error);
++      }
++    } else {
++      log('No token found in cookie');
++    }
++  }
++
+   // Final return, userId may be undefined
+   log(
+     'All authentication methods attempted, returning final context, userId: %s',
+diff --git a/src/server/services/tokenAuth/index.test.ts b/src/server/services/tokenAuth/index.test.ts
+new file mode 100644
+index 000000000..d1df0f015
+--- /dev/null
++++ b/src/server/services/tokenAuth/index.test.ts
+@@ -0,0 +1,238 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++
++import { TokenAuthService } from '@/server/services/tokenAuth';
++
++// Mock the database
++const mockDb = {
++    query: {
++        users: {
++            findFirst: vi.fn(),
++        },
++    },
++    insert: vi.fn().mockReturnValue({
++        values: vi.fn().mockReturnValue({
++            returning: vi.fn(),
++        }),
++    }),
++};
++
++// Mock fetch for external API
++const mockFetch = vi.fn();
++global.fetch = mockFetch;
++
++// Mock UserService - all mocks must be defined inside the factory function
++vi.mock('@/server/services/user', () => ({
++    UserService: vi.fn().mockImplementation(() => ({
++        initUser: vi.fn().mockResolvedValue(undefined),
++    })),
++}));
++
++// Mock authEnv
++vi.mock('@/envs/auth', () => ({
++    authEnv: {
++        AUTH_TOKEN_VERIFY_URL: 'https://example.com/api/user',
++        AUTH_TOKEN_COOKIE_KEY: 'token',
++        AUTH_TOKEN_USER_INFO_ID_KEY: 'id',
++        AUTH_TOKEN_USER_INFO_EMAIL_KEY: 'email',
++        AUTH_TOKEN_USER_INFO_NAME_KEY: 'name',
++        AUTH_TOKEN_DEFAULT_EMAIL_DOMAIN: 'lobehub.com',
++    },
++}));
++
++describe('TokenAuthService', () => {
++    beforeEach(() => {
++        vi.clearAllMocks();
++        // Reset mock implementations
++        mockDb.insert.mockReturnValue({
++            values: vi.fn().mockReturnValue({
++                returning: vi.fn(),
++            }),
++        });
++    });
++
++    afterEach(() => {
++        vi.resetAllMocks();
++    });
++
++    describe('static methods', () => {
++        it('isTokenAuthEnabled should return true when AUTH_TOKEN_VERIFY_URL is set', () => {
++            expect(TokenAuthService.isTokenAuthEnabled()).toBe(true);
++        });
++
++        it('getTokenCookieKey should return the configured cookie key', () => {
++            expect(TokenAuthService.getTokenCookieKey()).toBe('token');
++        });
++
++        it('extractTokenFromCookie should extract token from cookie header', () => {
++            const cookieHeader = 'token=test-token; other=value';
++            const token = TokenAuthService.extractTokenFromCookie(cookieHeader);
++            expect(token).toBe('test-token');
++        });
++
++        it('extractTokenFromCookie should return null when token not found', () => {
++            const cookieHeader = 'other=value; another=test';
++            const token = TokenAuthService.extractTokenFromCookie(cookieHeader);
++            expect(token).toBeNull();
++        });
++
++        it('extractTokenFromCookie should return null when cookie header is null', () => {
++            const token = TokenAuthService.extractTokenFromCookie(null);
++            expect(token).toBeNull();
++        });
++    });
++
++    describe('authenticateWithToken', () => {
++        it('should return null when external API returns non-OK status', async () => {
++            mockFetch.mockResolvedValueOnce({
++                ok: false,
++                status: 401,
++            });
++
++            const service = new TokenAuthService(mockDb as any);
++            const result = await service.authenticateWithToken('test-token');
++
++            expect(result).toBeNull();
++            expect(mockFetch).toHaveBeenCalledWith(
++                'https://example.com/api/user',
++                {
++                    headers: {
++                        Cookie: 'token=test-token',
++                    },
++                },
++            );
++        });
++
++        it('should return null when user info missing both id and name', async () => {
++            mockFetch.mockResolvedValueOnce({
++                ok: true,
++                json: async () => ({ email: 'test@example.com' }),
++            });
++
++            const service = new TokenAuthService(mockDb as any);
++            const result = await service.authenticateWithToken('test-token');
++
++            expect(result).toBeNull();
++        });
++
++        it('should create new user when user does not exist', async () => {
++            mockFetch.mockResolvedValueOnce({
++                ok: true,
++                json: async () => ({
++                    id: 'external-user-id',
++                    email: 'test@example.com',
++                    name: 'Test User',
++                }),
++            });
++
++            mockDb.query.users.findFirst.mockResolvedValueOnce(null);
++
++            const mockReturning = vi.fn().mockResolvedValueOnce([
++                {
++                    id: 'user_external-user-id',
++                    email: 'test@example.com',
++                    fullName: 'Test User',
++                    createdAt: new Date(),
++                },
++            ]);
++
++            mockDb.insert.mockReturnValueOnce({
++                values: vi.fn().mockReturnValueOnce({
++                    returning: mockReturning,
++                }),
++            });
++
++            const service = new TokenAuthService(mockDb as any);
++            const result = await service.authenticateWithToken('test-token');
++
++            expect(result).not.toBeNull();
++            expect(result?.userId).toBeDefined();
++            expect(result?.sessionToken).toBeDefined();
++        });
++
++        it('should generate email from name when email is not provided', async () => {
++            mockFetch.mockResolvedValueOnce({
++                ok: true,
++                json: async () => ({
++                    id: 'external-user-id',
++                    name: 'Test User Name',
++                }),
++            });
++
++            mockDb.query.users.findFirst.mockResolvedValueOnce(null);
++
++            const mockReturning = vi.fn().mockResolvedValueOnce([
++                {
++                    id: 'user_external-user-id',
++                    email: 'test.user.name@lobehub.com',
++                    fullName: 'Test User Name',
++                    createdAt: new Date(),
++                },
++            ]);
++
++            mockDb.insert.mockReturnValueOnce({
++                values: vi.fn().mockReturnValueOnce({
++                    returning: mockReturning,
++                }),
++            });
++
++            const service = new TokenAuthService(mockDb as any);
++            const result = await service.authenticateWithToken('test-token');
++
++            expect(result).not.toBeNull();
++            expect(result?.userId).toBeDefined();
++        });
++
++        it('should use existing user when user exists by email', async () => {
++            mockFetch.mockResolvedValueOnce({
++                ok: true,
++                json: async () => ({
++                    email: 'existing@example.com',
++                    name: 'Existing User',
++                }),
++            });
++
++            mockDb.query.users.findFirst.mockResolvedValueOnce({
++                id: 'existing-user-id',
++                email: 'existing@example.com',
++            });
++
++            const mockReturning = vi.fn().mockResolvedValueOnce([
++                {
++                    id: 'session-id',
++                    token: 'session-token',
++                    userId: 'existing-user-id',
++                    expiresAt: new Date(),
++                },
++            ]);
++
++            mockDb.insert.mockReturnValueOnce({
++                values: vi.fn().mockReturnValueOnce({
++                    returning: mockReturning,
++                }),
++            });
++
++            const service = new TokenAuthService(mockDb as any);
++            const result = await service.authenticateWithToken('test-token');
++
++            expect(result).not.toBeNull();
++            expect(result?.userId).toBe('existing-user-id');
++        });
++
++        it('should handle non-string values in response', async () => {
++            mockFetch.mockResolvedValueOnce({
++                ok: true,
++                json: async () => ({
++                    id: 123, // number instead of string
++                    email: 'test@example.com',
++                    name: null, // null instead of string
++                }),
++            });
++
++            const service = new TokenAuthService(mockDb as any);
++            const result = await service.authenticateWithToken('test-token');
++
++            // Should return null because id is not a string and name is null
++            expect(result).toBeNull();
++        });
++    });
++});
+\ No newline at end of file
+diff --git a/src/server/services/tokenAuth/index.ts b/src/server/services/tokenAuth/index.ts
+new file mode 100644
+index 000000000..58121e4d1
+--- /dev/null
++++ b/src/server/services/tokenAuth/index.ts
+@@ -0,0 +1,288 @@
++import type { LobeChatDatabase } from '@lobechat/database';
++import { createNanoId, idGenerator } from '@lobechat/database';
++import { session, users } from '@lobechat/database/schemas';
++import debug from 'debug';
++import { eq } from 'drizzle-orm';
++
++import { authEnv } from '@/envs/auth';
++import { UserService } from '@/server/services/user';
++
++const log = debug('lobe-server:token-auth');
++
++/**
++ * Get nested value from object using dot-separated key path.
++ * Similar to lodash.get, supports keys like 'data.user.email'.
++ *
++ * @param obj - The object to get value from
++ * @param path - Dot-separated key path (e.g., 'data.user.email')
++ * @returns The value at the path, or undefined if not found
++ */
++const getNestedValue = (obj: Record<string, unknown>, path: string): unknown => {
++  if (!path) return undefined;
++
++  const keys = path.split('.');
++  let current: unknown = obj;
++
++  for (const key of keys) {
++    if (current === null || current === undefined) {
++      return undefined;
++    }
++
++    if (typeof current !== 'object') {
++      return undefined;
++    }
++
++    current = (current as Record<string, unknown>)[key];
++  }
++
++  return current;
++};
++
++/**
++ * User info returned from the token verification API
++ */
++interface TokenVerifyUserInfo {
++  email: string;
++  id: string;
++  name: string;
++}
++
++/**
++ * Result of token authentication
++ */
++interface TokenAuthResult {
++  sessionToken: string;
++  userId: string;
++}
++
++/**
++ * TokenAuthService handles token-based authentication from cookie tokens.
++ *
++ * When a user is not logged in but has a token cookie, this service:
++ * 1. Calls the configured verification URL to validate the token
++ * 2. Creates a local user if the user doesn't exist
++ * 3. Creates a Better Auth session for the user
++ */
++export class TokenAuthService {
++  private db: LobeChatDatabase;
++
++  constructor(db: LobeChatDatabase) {
++    this.db = db;
++  }
++
++  /**
++   * Check if token authentication is enabled
++   */
++  static isTokenAuthEnabled(): boolean {
++    return !!authEnv.AUTH_TOKEN_VERIFY_URL;
++  }
++
++  /**
++   * Get the configured token cookie key
++   */
++  static getTokenCookieKey(): string {
++    return authEnv.AUTH_TOKEN_COOKIE_KEY || 'token';
++  }
++
++  /**
++   * Extract token from cookie header
++   */
++  static extractTokenFromCookie(cookieHeader: string | null): string | null {
++    if (!cookieHeader) return null;
++
++    const tokenKey = TokenAuthService.getTokenCookieKey();
++    const cookies = cookieHeader.split(';').map((c) => c.trim());
++
++    for (const cookie of cookies) {
++      const [key, value] = cookie.split('=');
++      if (key === tokenKey && value) {
++        return value.trim();
++      }
++    }
++
++    return null;
++  }
++
++  /**
++   * Extract user info from API response using configured key paths
++   */
++  private extractUserInfoFromResponse(responseData: Record<string, unknown>): TokenVerifyUserInfo | null {
++    const idKey = authEnv.AUTH_TOKEN_USER_INFO_ID_KEY || 'id';
++    const emailKey = authEnv.AUTH_TOKEN_USER_INFO_EMAIL_KEY || 'email';
++    const nameKey = authEnv.AUTH_TOKEN_USER_INFO_NAME_KEY || 'name';
++
++    const id = getNestedValue(responseData, idKey);
++    const email = getNestedValue(responseData, emailKey);
++    const name = getNestedValue(responseData, nameKey);
++
++    log('Extracted user info: id=%s, email=%s, name=%s', id, email, name);
++
++    // Convert to string types
++    const idStr = typeof id === 'string' ? id : undefined;
++    const emailStr = typeof email === 'string' ? email : undefined;
++    const nameStr = typeof name === 'string' ? name : undefined;
++
++    // If we don't have at least id or name, we can't create a user
++    if (!idStr && !nameStr) {
++      log('User info missing both id and name');
++      return null;
++    }
++
++    // Generate email if not provided
++    let finalEmail = emailStr;
++    if (!finalEmail && nameStr) {
++      const defaultDomain = authEnv.AUTH_TOKEN_DEFAULT_EMAIL_DOMAIN || 'lobehub.com';
++      // Generate email from name: convert to lowercase and replace spaces with dots
++      const emailPrefix = nameStr.toLowerCase().replaceAll(/\s+/g, '.');
++      finalEmail = `${emailPrefix}@${defaultDomain}`;
++      log('Generated email from name: %s', finalEmail);
++    }
++
++    return {
++      email: finalEmail || '',
++      id: idStr || '',
++      name: nameStr || '',
++    };
++  }
++
++  /**
++   * Verify token with the external API
++   */
++  private async verifyTokenWithExternalApi(token: string): Promise<TokenVerifyUserInfo | null> {
++    const verifyUrl = authEnv.AUTH_TOKEN_VERIFY_URL;
++    if (!verifyUrl) {
++      log('Token verification URL not configured');
++      return null;
++    }
++
++    try {
++      log('Verifying token with external API: %s', verifyUrl);
++      const tokenKey = TokenAuthService.getTokenCookieKey();
++      const response = await fetch(verifyUrl, {
++        headers: {
++          Cookie: `${tokenKey}=${token}`,
++        },
++      });
++
++      if (!response.ok) {
++        log('Token verification failed with status: %d', response.status);
++        return null;
++      }
++
++      const responseData = await response.json() as Record<string, unknown>;
++      log('Token verification response: %O', responseData);
++
++      return this.extractUserInfoFromResponse(responseData);
++    } catch (error) {
++      log('Token verification error: %O', error);
++      return null;
++    }
++  }
++
++  /**
++   * Find or create user based on external API user info
++   */
++  private async findOrCreateUser(userInfo: TokenVerifyUserInfo): Promise<string> {
++    // Try to find user by email first
++    if (userInfo.email) {
++      const existingUser = await this.db.query.users.findFirst({
++        where: eq(users.email, userInfo.email),
++      });
++
++      if (existingUser) {
++        log('Found existing user by email: %s', existingUser.id);
++        return existingUser.id;
++      }
++    }
++
++    // Create new user
++    const userId = userInfo.id || idGenerator('user', 32 - 'user_'.length);
++    const now = new Date();
++
++    log('Creating new user: %s', userId);
++
++    const [newUser] = await this.db
++      .insert(users)
++      .values({
++        id: userId,
++        email: userInfo.email || null,
++        fullName: userInfo.name || null,
++        emailVerified: true, // Token from external API is considered verified
++        createdAt: now,
++        updatedAt: now,
++        lastActiveAt: now,
++      })
++      .returning();
++
++    // Initialize user settings and business features
++    const userService = new UserService(this.db);
++    await userService.initUser({
++      email: newUser.email,
++      id: newUser.id,
++      username: null,
++      createdAt: newUser.createdAt,
++    });
++
++    return newUser.id;
++  }
++
++  /**
++   * Create a Better Auth session for the user
++   */
++  private async createSession(userId: string, ipAddress?: string, userAgent?: string): Promise<string> {
++    // Generate session token using nanoid (32 chars like Better Auth)
++    const sessionToken = createNanoId(32)();
++    const sessionId = createNanoId(12)();
++    const now = new Date();
++
++    // Session expires in 7 days (Better Auth default)
++    const expiresAt = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
++
++    log('Creating session for user: %s, token: %s', userId, sessionToken);
++
++    await this.db.insert(session).values({
++      id: sessionId,
++      token: sessionToken,
++      userId,
++      expiresAt,
++      ipAddress: ipAddress || null,
++      userAgent: userAgent || null,
++      createdAt: now,
++      updatedAt: now,
++    });
++
++    return sessionToken;
++  }
++
++  /**
++   * Authenticate user using token from cookie
++   *
++   * @param token - The token extracted from cookie
++   * @param ipAddress - Optional IP address for session
++   * @param userAgent - Optional user agent for session
++   * @returns TokenAuthResult with session token and user ID, or null if authentication fails
++   */
++  async authenticateWithToken(
++    token: string,
++    ipAddress?: string,
++    userAgent?: string,
++  ): Promise<TokenAuthResult | null> {
++    // Verify token with external API
++    const userInfo = await this.verifyTokenWithExternalApi(token);
++    if (!userInfo) {
++      log('Token verification returned no user info');
++      return null;
++    }
++
++    // Find or create user
++    const userId = await this.findOrCreateUser(userInfo);
++
++    // Create session
++    const sessionToken = await this.createSession(userId, ipAddress, userAgent);
++
++    return {
++      sessionToken,
++      userId,
++    };
++  }
++}
+\ No newline at end of file
