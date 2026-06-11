@@ -2,7 +2,7 @@ import type { AgentRuntimeContext, AgentState } from '@lobechat/agent-runtime';
 import { BUILTIN_AGENT_SLUGS, getAgentRuntimeConfig } from '@lobechat/builtin-agents';
 import { builtinSkills } from '@lobechat/builtin-skills';
 import { CloudSandboxManifest } from '@lobechat/builtin-tool-cloud-sandbox';
-import { LobeAgentManifest } from '@lobechat/builtin-tool-lobe-agent';
+import { LobeAgentIdentifier, LobeAgentManifest } from '@lobechat/builtin-tool-lobe-agent';
 import { LocalSystemManifest } from '@lobechat/builtin-tool-local-system';
 import { MessageToolIdentifier } from '@lobechat/builtin-tool-message';
 import { PageAgentIdentifier } from '@lobechat/builtin-tool-page-agent';
@@ -34,8 +34,8 @@ import type {
   ExecAgentResult,
   ExecGroupAgentParams,
   ExecGroupAgentResult,
-  ExecSubAgentTaskParams,
-  ExecSubAgentTaskResult,
+  ExecSubAgentParams,
+  ExecSubAgentResult,
   LobeAgentAgencyConfig,
   MessagePluginItem,
   UserInterventionConfig,
@@ -61,7 +61,7 @@ import { TopicModel } from '@/database/models/topic';
 import { UserModel } from '@/database/models/user';
 import { UserPersonaModel } from '@/database/models/userMemory/persona';
 import { toolsEnv } from '@/envs/tools';
-import { resolveRuntimeMode } from '@/helpers/executionTarget';
+import { resolveExecutionPlan, resolveRuntimeMode } from '@/helpers/executionTarget';
 import { shouldEnableBuiltinSkill } from '@/helpers/skillFilters';
 import { buildConnectorManifests } from '@/libs/mcp/buildConnectorManifests';
 import { signOperationJwt, signUserJWT } from '@/libs/trpc/utils/internalJwt';
@@ -71,7 +71,12 @@ import { createServerAgentToolsEngine } from '@/server/modules/Mecha';
 import type { ServerUserMemoryConfig } from '@/server/modules/Mecha/ContextEngineering/types';
 import { AgentService } from '@/server/services/agent';
 import { AgentDocumentsService } from '@/server/services/agentDocuments';
-import type { AgentRuntimeServiceOptions } from '@/server/services/agentRuntime';
+import type {
+  AgentExecutionParams,
+  AgentExecutionResult,
+  AgentRuntimeServiceOptions,
+  SubAgentBridgeParams,
+} from '@/server/services/agentRuntime';
 import { AgentRuntimeService } from '@/server/services/agentRuntime';
 import { getAbortError, isAbortError, throwIfAborted } from '@/server/services/agentRuntime/abort';
 import { hookDispatcher } from '@/server/services/agentRuntime/hooks';
@@ -298,7 +303,17 @@ export class AiAgentService {
     this.topicModel = new TopicModel(db, userId, wsId);
     this.agentRuntimeService = new AgentRuntimeService(db, userId, {
       ...options?.runtimeOptions,
-      execSubAgentTask: this.execSubAgentTask.bind(this),
+      // ── Runtime delegate ─────────────────────────────────────────────────
+      // Operations the runtime delegates back UP to this layer. The dependency
+      // arrow is one-way (AiAgentService → AgentRuntimeService), so the runtime
+      // can't import us; instead we hand it the callbacks it needs to trigger
+      // high-level pipelines mid-step. See AgentRuntimeDelegate. New high-level
+      // capabilities the runtime calls into go in this `delegate` object.
+      //
+      // `execSubAgent` is an auto-bound arrow field, so no `.bind(this)`.
+      delegate: {
+        execSubAgent: this.execSubAgent,
+      },
       workspaceId: wsId,
     });
     this.marketService = new MarketService({ userInfo: { userId } });
@@ -386,6 +401,31 @@ export class AiAgentService {
       log('execAgent: resolveWorkspaceInit failed: %O', error);
       return empty;
     }
+  }
+
+  /**
+   * Execute a single agent step against this service's runtime.
+   *
+   * Delegates to the internal AgentRuntimeService, which is already wired with
+   * the `execSubAgent` fork callback. The QStash step worker drives stepping
+   * through here so `lobe-agent.callSubAgent` can fork sub-agents — building a
+   * bare runtime there would lose the callback and fail with SUB_AGENT_UNAVAILABLE.
+   */
+  executeStep(params: AgentExecutionParams): Promise<AgentExecutionResult> {
+    return this.agentRuntimeService.executeStep(params);
+  }
+
+  /**
+   * Run the sub-agent completion bridge against this service's runtime.
+   *
+   * Same rationale as `executeStep`: the QStash `subagent-callback` webhook
+   * drives the bridge through here so the runtime's models stay
+   * workspace-scoped — a bare AgentRuntimeService would be personal-scoped
+   * and the tool-message backfill / resume barrier could miss
+   * workspace-scoped rows.
+   */
+  completeSubAgentBridge(params: SubAgentBridgeParams): Promise<boolean> {
+    return this.agentRuntimeService.completeSubAgentBridge(params);
   }
 
   /**
@@ -601,6 +641,10 @@ export class AiAgentService {
         ? agentConfig.plugins
         : [TaskIdentifier, ...(agentConfig.plugins ?? [])];
       log('execAgent: injected task-agent runtime for task scope');
+    }
+
+    if (appContext?.isSubAgent) {
+      agentConfig.plugins = agentConfig.plugins?.filter((id) => id !== LobeAgentIdentifier);
     }
 
     await throwIfExecutionAborted('agent configuration');
@@ -1048,17 +1092,23 @@ export class AiAgentService {
         }
       } else {
         // Local CLI hetero (claude-code / codex) — fork between device dispatch
-        // and cloud sandbox based on:
-        //   1. requestedDeviceId (topic-level override) — always wins
-        //   2. agencyConfig.executionTarget (agent-level default)
-        //        - 'device'  → dispatch to boundDeviceId (errors if unset/offline)
-        //        - 'sandbox' → cloud sandbox
-        //        - 'local' / undefined → cloud sandbox (server can't spawn locally)
-        const executionTarget = agentConfig.agencyConfig?.executionTarget;
-        const dispatchDeviceId = requestedDeviceId || agentConfig.agencyConfig?.boundDeviceId;
-        const useDevice = !!requestedDeviceId || executionTarget === 'device';
+        // and cloud sandbox via the shared execution plan:
+        //   - requestedDeviceId (topic-level override) always wins
+        //   - executionTarget 'device' → dispatch to boundDeviceId (errors if unset)
+        //   - everything else ('sandbox' / 'local' / 'none' / unset) → cloud
+        //     sandbox (the server can't spawn locally, and a hetero agent must
+        //     execute somewhere)
+        // `onlineDeviceIds` is intentionally omitted: hetero dispatch trusts
+        // the binding and fails loudly at the gateway if the device is offline.
+        const heteroPlan = resolveExecutionPlan({
+          agencyConfig: agentConfig.agencyConfig,
+          isDesktop: false,
+          isHetero: true,
+          requestedDeviceId,
+        });
 
-        if (useDevice) {
+        if (heteroPlan.kind !== 'sandbox') {
+          const dispatchDeviceId = heteroPlan.kind === 'device' ? heteroPlan.deviceId : undefined;
           if (!dispatchDeviceId) {
             log('execAgent: hetero executionTarget=device but no boundDeviceId set');
             await this.messageModel.update(assistantMsg.id, {
@@ -1512,40 +1562,37 @@ export class AiAgentService {
         ...(shouldEnableVisualUnderstanding ? [LobeAgentManifest.identifier] : []),
       ];
 
-      // Derive activeDeviceId from device context. Gated on `canUseDevice`
-      // first — without this guard, an external bot sender's turn would still
-      // populate `state.metadata.activeDeviceId`, and `buildStepToolDelta`
-      // re-injects `LocalSystemManifest` whenever activeDeviceId is set,
-      // bypassing the engine's enabledToolIds exclusion. Skipping the
-      // assignment here closes that bypass at the source.
+      // Resolve THE device decision for this run. All rules live in
+      // `resolveExecutionPlan` (gated on `canUseDevice` first, `none`/`sandbox`
+      // never route to a device, offline bindings stay unrouted, unbound runs
+      // auto-activate only with exactly one device online). Without the
+      // `canUseDevice` gate an external bot sender's turn would still populate
+      // `state.metadata.activeDeviceId`, and `buildStepToolDelta` re-injects
+      // `LocalSystemManifest` whenever activeDeviceId is set, bypassing the
+      // engine's enabledToolIds exclusion — resolving the plan here closes
+      // that bypass at the source.
       //
-      // Resolution order:
-      // 0. executionTarget === 'sandbox': always skip — sandbox and device are
-      //    mutually exclusive. Without this gate a single online device would
-      //    be auto-activated and local-system tool calls would silently route
-      //    to that device instead of being suppressed for the sandbox session.
-      // 1. boundDeviceId (topic-bound > agent-bound): use if online; if offline,
-      //    respect the explicit choice and stay unrouted — don't silently fall
-      //    back to a different device, that would surprise the user.
-      // 2. No bound device: auto-activate only when EXACTLY ONE device is
-      //    online. Multi-device users must bind explicitly — picking by
-      //    recency / first-online would be a guess that could route tool calls
-      //    to the wrong machine. This applies uniformly to regular chat and
-      //    IM/Bot — the previous "regular-chat does nothing" path was the bug
-      //    behind (the local-system system prompt's
-      //    `{{workingDirectory}}` reached the LLM as a literal, wasting the
-      //    first N steps groping for cwd).
-      const regularAgentExecutionTarget = agentConfig.agencyConfig?.executionTarget;
-      activeDeviceId =
-        !canUseDevice || regularAgentExecutionTarget === 'sandbox'
-          ? undefined
-          : boundDeviceId
-            ? onlineDevices.some((device) => device.deviceId === boundDeviceId)
-              ? boundDeviceId
-              : undefined
-            : onlineDevices.length === 1
-              ? onlineDevices[0].deviceId
-              : undefined;
+      // `isDesktop` uses `gatewayConfigured` as a proxy: a device-gateway
+      // deployment serves desktop-class users, so the unset-target default
+      // resolves to `local` there and `none` otherwise.
+      const executionPlan = resolveExecutionPlan({
+        agencyConfig: agentConfig.agencyConfig,
+        canUseDevice,
+        isDesktop: gatewayConfigured,
+        onlineDeviceIds: onlineDevices.map((device) => device.deviceId),
+        requestedDeviceId,
+      });
+      // Device tools (local-system / remote-device proxy) only exist in a
+      // device-capable session — `none` and `sandbox` sessions must never see
+      // them, not even the proxy that could activate a device mid-run.
+      const deviceCapable =
+        executionPlan.kind === 'device' || executionPlan.kind === 'device-unrouted';
+      activeDeviceId = executionPlan.kind === 'device' ? executionPlan.deviceId : undefined;
+      log(
+        'execAgent: execution plan → kind=%s deviceId=%s',
+        executionPlan.kind,
+        activeDeviceId ?? 'none',
+      );
 
       const toolsEngine = createServerAgentToolsEngine(toolsContext, {
         additionalManifests: [...lobehubSkillManifests, ...klavisManifests, ...connectorManifests],
@@ -1623,14 +1670,9 @@ export class AiAgentService {
         canUseDevice,
         disableLocalSystem,
       });
-      // Resolve effective runtimeMode once, mirroring AgentToolsEngine's derivation:
-      // executionTarget wins; falls back to per-platform chatConfig.runtimeEnv.runtimeMode
-      // for legacy agents that predate the unified executionTarget field.
-      const agentRuntimeMode = resolveRuntimeMode(
-        agentConfig.agencyConfig,
-        agentConfig.chatConfig?.runtimeEnv?.runtimeMode?.[gatewayConfigured ? 'desktop' : 'web'],
-        gatewayConfigured,
-      );
+      // Resolve effective runtimeMode once, mirroring AgentToolsEngine's derivation
+      // from the unified executionTarget field.
+      const agentRuntimeMode = resolveRuntimeMode(agentConfig.agencyConfig, gatewayConfigured);
       // When sandbox is not the active runtime, remove lobe-cloud-sandbox from the
       // manifest map. The initial seed via getEnabledPluginManifests (which includes
       // defaultToolIds) may have already placed it there, and the allowedBuiltinTools
@@ -1639,12 +1681,25 @@ export class AiAgentService {
       if (agentRuntimeMode !== 'cloud') {
         delete toolManifestMap[CloudSandboxManifest.identifier];
       }
+      // Same single-point deletion for the device tools: a `none` / `sandbox`
+      // session must not expose the remote-device proxy either — leaving it
+      // discoverable would let the model activate a device mid-run and bypass
+      // the execution plan ("无设备" means NO device, not "no device yet").
+      // Scoped to gateway deployments: in the standalone Electron deployment
+      // (no DEVICE_GATEWAY) local-system routes in-process via the 'client'
+      // executor marking below, and the desktop client owns the tool gate.
+      const stripDeviceTools = gatewayConfigured && !deviceCapable;
+      if (stripDeviceTools) {
+        delete toolManifestMap[RemoteDeviceManifest.identifier];
+        delete toolManifestMap[LocalSystemManifest.identifier];
+      }
       for (const tool of allowedBuiltinTools) {
         // lobe-cloud-sandbox is only activator-discoverable when runtimeMode resolves
-        // to 'cloud'. Handles both executionTarget='sandbox' (new) and the legacy
-        // chatConfig.runtimeEnv.runtimeMode='cloud' path via resolveRuntimeMode.
+        // to 'cloud' (i.e. executionTarget='sandbox').
         if (tool.identifier === CloudSandboxManifest.identifier && agentRuntimeMode !== 'cloud')
           continue;
+        // device tools are only activator-discoverable in device-capable sessions
+        if (stripDeviceTools && isDeviceToolIdentifier(tool.identifier)) continue;
         if (tool.discoverable !== false && !toolManifestMap[tool.identifier]) {
           toolManifestMap[tool.identifier] = tool.manifest as LobeToolManifest;
         }
@@ -2519,6 +2574,7 @@ export class AiAgentService {
           defaultTaskAssigneeAgentId: appContext?.defaultTaskAssigneeAgentId,
           documentId: appContext?.documentId,
           groupId: appContext?.groupId,
+          isSubAgent: appContext?.isSubAgent,
           scope: appContext?.scope,
           sourceMessageId: userMessageRecord?.id ?? parentMessageId ?? undefined,
           taskId: operationTaskId,
@@ -2721,7 +2777,9 @@ export class AiAgentService {
    * 2. Delegate to execAgent with threadId in appContext
    * 3. Store operationId in Thread metadata
    */
-  async execSubAgentTask(params: ExecSubAgentTaskParams): Promise<ExecSubAgentTaskResult> {
+  // Arrow field (not a method) so it stays bound to this instance when handed to
+  // AgentRuntimeService as the `execSubAgent` fork callback — no `.bind(this)`.
+  execSubAgent = async (params: ExecSubAgentParams): Promise<ExecSubAgentResult> => {
     const {
       groupId,
       topicId,
@@ -2734,7 +2792,7 @@ export class AiAgentService {
     } = params;
 
     log(
-      'execSubAgentTask: agentId=%s, groupId=%s, topicId=%s, instruction=%s',
+      'execSubAgent: agentId=%s, groupId=%s, topicId=%s, instruction=%s',
       agentId,
       groupId,
       topicId,
@@ -2767,7 +2825,7 @@ export class AiAgentService {
       throw new Error('Failed to create thread for task execution');
     }
 
-    log('execSubAgentTask: created thread %s', thread.id);
+    log('execSubAgent: created thread %s', thread.id);
 
     // 2. Update Thread status to processing with startedAt timestamp
     const startedAt = new Date().toISOString();
@@ -2803,7 +2861,7 @@ export class AiAgentService {
         ).findById(parentOperationId);
         inheritedTrigger = parentOp?.trigger ?? undefined;
       } catch (error) {
-        log('execSubAgentTask: failed to read parent operation trigger: %O', error);
+        log('execSubAgent: failed to read parent operation trigger: %O', error);
       }
     }
 
@@ -2822,7 +2880,7 @@ export class AiAgentService {
     });
 
     log(
-      'execSubAgentTask: delegated to execAgent, operationId=%s, success=%s',
+      'execSubAgent: delegated to execAgent, operationId=%s, success=%s',
       result.operationId,
       result.success,
     );
@@ -2878,7 +2936,7 @@ export class AiAgentService {
       success: result.success ?? false,
       threadId: thread.id,
     };
-  }
+  };
 
   /**
    * Create step lifecycle callbacks for updating Thread metadata
@@ -2917,13 +2975,9 @@ export class AiAgentService {
               totalToolCalls: accumulatedToolCalls,
             },
           });
-          log(
-            'execSubAgentTask: updated thread %s metadata after step %d',
-            threadId,
-            state.stepCount,
-          );
+          log('execSubAgent: updated thread %s metadata after step %d', threadId, state.stepCount);
         } catch (error) {
-          log('execSubAgentTask: failed to update thread metadata: %O', error);
+          log('execSubAgent: failed to update thread metadata: %O', error);
         }
       },
 
@@ -2957,7 +3011,7 @@ export class AiAgentService {
 
         // Log error when task fails
         if (reason === 'error' && finalState.error) {
-          console.error('execSubAgentTask: task failed for thread %s:', threadId, finalState.error);
+          console.error('execSubAgent: task failed for thread %s:', threadId, finalState.error);
         }
 
         try {
@@ -2971,7 +3025,7 @@ export class AiAgentService {
             await this.messageModel.update(sourceMessageId, {
               content: lastAssistantMessage.content,
             });
-            log('execSubAgentTask: updated task message %s with summary', sourceMessageId);
+            log('execSubAgent: updated task message %s with summary', sourceMessageId);
           }
 
           // Format error for proper serialization (Error objects don't serialize with JSON.stringify)
@@ -2994,13 +3048,13 @@ export class AiAgentService {
           });
 
           log(
-            'execSubAgentTask: thread %s completed with status %s, reason: %s',
+            'execSubAgent: thread %s completed with status %s, reason: %s',
             threadId,
             status,
             reason,
           );
         } catch (error) {
-          console.error('execSubAgentTask: failed to update thread on completion: %O', error);
+          console.error('execSubAgent: failed to update thread on completion: %O', error);
         }
       },
     };
@@ -3135,14 +3189,18 @@ export class AiAgentService {
   /**
    * Completion bridge for the server `callSubAgent` deferred-tool path.
    *
-   * Fires on the sub-op's completion (success or failure). It:
-   *   1. Backfills the parent's placeholder tool message with the sub-agent's
-   *      final answer (success) or an error note (failure), plus pluginState so
-   *      the UI render can resolve the isolation thread.
-   *   2. Asks the runtime to resume the parent: barrier-check that every pending
-   *      tool in this turn is now fulfilled, atomically claim the resume (CAS),
-   *      and schedule the next parent step. Concurrent sibling completions that
-   *      lose the CAS are no-ops.
+   * Fires on the sub-op's completion (success or failure) and delegates to
+   * `AgentRuntimeService.completeSubAgentBridge`: backfill the parent's
+   * placeholder tool message, then barrier-check + CAS-resume the parked
+   * parent op.
+   *
+   * Transport adapts to the runtime mode like every other lifecycle hook:
+   *   - local mode: the `handler` runs in-process with the child's finalState.
+   *   - queue mode: in-memory handlers don't survive cross-process steps, so
+   *     the serialized `webhook` config is delivered via QStash to
+   *     `/api/agent/webhooks/subagent-callback`, which re-enters the same
+   *     bridge method. `delivery: 'qstash'` is required — a plain fetch would
+   *     be rejected by the endpoint's QStash signature auth.
    */
   private createSubAgentBridgeHook(
     parentOperationId: string,
@@ -3151,45 +3209,18 @@ export class AiAgentService {
   ): AgentHook {
     return {
       handler: async (event) => {
-        const finalState = event.finalState;
-        const failed = event.reason === 'error' || event.reason === 'interrupted';
-
-        // 1. Backfill the placeholder tool message with the result
         try {
-          const lastAssistant = finalState?.messages
-            ?.slice()
-            .reverse()
-            .find((m: { content?: string; role: string }) => m.role === 'assistant');
-
-          const content = failed
-            ? `Sub-agent did not complete (${event.reason}).`
-            : lastAssistant?.content || 'Sub-agent completed without a textual answer.';
-
-          await this.messageModel.updateToolMessage(toolMessageId, {
-            content,
-            pluginError: failed ? formatErrorForMetadata(finalState?.error) : undefined,
-            pluginState: {
-              model: finalState?.modelRuntimeConfig?.model,
-              status: failed ? 'error' : 'completed',
-              threadId,
-              totalToolCalls: finalState?.usage?.tools?.totalCalls,
-              totalTokens: this.calculateTotalTokens(finalState?.usage),
-            },
+          await this.agentRuntimeService.completeSubAgentBridge({
+            finalState: event.finalState,
+            operationId: event.operationId,
+            parentOperationId,
+            reason: event.reason ?? 'done',
+            threadId,
+            toolMessageId,
           });
         } catch (error) {
           console.error(
-            'Sub-agent bridge: failed to backfill tool message %s: %O',
-            toolMessageId,
-            error,
-          );
-        }
-
-        // 2. Barrier + CAS + resume the parent op
-        try {
-          await this.agentRuntimeService.tryResumeParentFromAsyncTool({ parentOperationId });
-        } catch (error) {
-          console.error(
-            'Sub-agent bridge: failed to resume parent %s: %O',
+            'Sub-agent bridge: failed to complete bridge for parent %s: %O',
             parentOperationId,
             error,
           );
@@ -3197,6 +3228,21 @@ export class AiAgentService {
       },
       id: 'sub-agent-bridge',
       type: 'onComplete' as const,
+      webhook: {
+        body: { parentOperationId, threadId, toolMessageId },
+        delivery: 'qstash' as const,
+        // Keep the payload lean: the endpoint reloads the child's final state
+        // from the coordinator, so everything beyond these ids is dead weight.
+        // The default (all event fields) would ship the child's entire final
+        // answer (`lastAssistantContent`) — and any tool-produced attachments
+        // the shared lifecycle event extractor inlines — through QStash.
+        eventFields: ['operationId', 'reason', 'status'],
+        // The endpoint sits behind QStash signature auth, so the unsigned
+        // fetch fallback could never authenticate — it would only mask a
+        // publish failure as a silently-dropped 401, stranding the parent.
+        fallback: 'none' as const,
+        url: '/api/agent/webhooks/subagent-callback',
+      },
     };
   }
 
