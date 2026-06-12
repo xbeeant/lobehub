@@ -97,164 +97,8 @@ index 422fe85c8..4c85614c3 100644
      },
    });
  };
-diff --git a/src/app/(backend)/middleware/auth/index.ts b/src/app/(backend)/middleware/auth/index.ts
-index 376ab6967..51ea7720c 100644
---- a/src/app/(backend)/middleware/auth/index.ts
-+++ b/src/app/(backend)/middleware/auth/index.ts
-@@ -11,6 +11,7 @@ import { LOBE_CHAT_OIDC_AUTH_HEADER } from '@/envs/auth';
- import { extractTraceContext, injectActiveTraceHeaders } from '@/libs/observability/traceparent';
- import { assertOIDCUserActive } from '@/libs/oidc-provider/access-control';
- import { validateOIDCJWT } from '@/libs/oidc-provider/jwt';
-+import { TokenAuthService } from '@/services/tokenAuth';
- import { createErrorResponse } from '@/utils/errorResponse';
- 
- type RequestOptions = { params: Promise<{ provider?: string }> };
-@@ -82,7 +83,8 @@ export const checkAuth =
-     }
- 
-     let userId: string;
--
-+    let sessionCookie: string | null = null;
-+    
-     try {
-       // OIDC authentication (CLI)
-       const oidcAuthorization = req.headers.get(LOBE_CHAT_OIDC_AUTH_HEADER);
-@@ -120,33 +122,99 @@ export const checkAuth =
-           xClientType: req.headers.get('x-client-type'),
-         });
-       }
-+      // Try token authentication from cookie if Better Auth session not found
-+      if (!oidcAuthorization && TokenAuthService.isTokenAuthEnabled()) {
-+        const cookieHeader = req.headers.get('cookie');
-+        const cookieToken = TokenAuthService.extractTokenFromCookie(cookieHeader);
-+
-+        if (cookieToken) {
-+          try {
-+            const clientIp = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
-+              req.headers.get('x-real-ip')?.trim() || undefined;
-+            const userAgent = req.headers.get('user-agent') || undefined;
-+
-+            const tokenAuthService = new TokenAuthService(serverDB);
-+            const tokenAuthResult = await tokenAuthService.authenticateWithToken(
-+              cookieToken,
-+              clientIp,
-+              userAgent,
-+            );
-+
-+            if (tokenAuthResult) {
-+              userId = tokenAuthResult.userId;
-+              sessionCookie = tokenAuthResult.sessionToken;
-+              // Continue to handler with authenticated user
-+            } else {
-+              // Token verification failed, return unauthorized
-+              return createErrorResponse(ChatErrorType.Unauthorized, {
-+                error: e,
-+                provider: params?.provider,
-+              });
-+            }
-+          } catch (tokenError) {
-+            console.error('[auth] Token authentication failed:', tokenError);
-+            return createErrorResponse(ChatErrorType.Unauthorized, {
-+              error: e,
-+              provider: params?.provider,
-+            });
-+          }
-+        } else {
-+          // if the error is not a ChatCompletionErrorPayload, it means the application error
-+          if (!(e as ChatCompletionErrorPayload).errorType) {
-+            if (isUnauthorizedAuthError(e)) {
-+              return createErrorResponse(ChatErrorType.Unauthorized, {
-+                error: e,
-+                provider: params?.provider,
-+              });
-+            }
-+
-+            // other issue will be internal server error
-+            console.error(e);
-+            return createErrorResponse(ChatErrorType.InternalServerError, {
-+              error: e,
-+              provider: params?.provider,
-+            });
-+          }
- 
--      // if the error is not a ChatCompletionErrorPayload, it means the application error
--      if (!(e as ChatCompletionErrorPayload).errorType) {
--        if (isUnauthorizedAuthError(e)) {
--          return createErrorResponse(ChatErrorType.Unauthorized, {
-+        const {
-+          errorType = ChatErrorType.InternalServerError,
-+          error: errorContent,
-+          ...res
-+        } = e as ChatCompletionErrorPayload;
-+
-+        const error = errorContent || e;
-+
-+        return createErrorResponse(errorType, { error, ...res, provider: params?.provider });
-+
-+      }
-+      } else {
-+        // if the error is not a ChatCompletionErrorPayload, it means the application error
-+        if (!(e as ChatCompletionErrorPayload).errorType) {
-+          if (isUnauthorizedAuthError(e)) {
-+            return createErrorResponse(ChatErrorType.Unauthorized, {
-+              error: e,
-+              provider: params?.provider,
-+            });
-+          }
-+
-+          // other issue will be internal server error
-+          console.error(e);
-+          return createErrorResponse(ChatErrorType.InternalServerError, {
-             error: e,
-             provider: params?.provider,
-           });
-         }
- 
--        // other issue will be internal server error
--        console.error(e);
--        return createErrorResponse(ChatErrorType.InternalServerError, {
--          error: e,
--          provider: params?.provider,
--        });
--      }
--
--      const {
--        errorType = ChatErrorType.InternalServerError,
--        error: errorContent,
--        ...res
--      } = e as ChatCompletionErrorPayload;
-+        const {
-+          errorType = ChatErrorType.InternalServerError,
-+          error: errorContent,
-+          ...res
-+        } = e as ChatCompletionErrorPayload;
- 
--      const error = errorContent || e;
-+        const error = errorContent || e;
- 
--      return createErrorResponse(errorType, { error, ...res, provider: params?.provider });
-+        return createErrorResponse(errorType, { error, ...res, provider: params?.provider });
-+      }
-     }
- 
-     const jwtPayload: ClientSecretPayload = { userId };
-@@ -172,6 +240,14 @@ export const checkAuth =
-       if (!traceparent) {
-         return res;
-       }
-+      
-+      // Set session cookie if token authentication was used
-+      if (sessionCookie) {
-+        headers.append(
-+          'Set-Cookie',
-+          `better-auth.session_token=${sessionCookie}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${7 * 24 * 60 * 60}`,
-+        );
-+      }
- 
-       return new Response(res.body, { headers, status: res.status, statusText: res.statusText });
-     } catch (err) {
 diff --git a/src/libs/next/proxy/define-config.ts b/src/libs/next/proxy/define-config.ts
-index 74564c56f..0dc14d3c7 100644
+index 74564c56f..27af0d7b7 100644
 --- a/src/libs/next/proxy/define-config.ts
 +++ b/src/libs/next/proxy/define-config.ts
 @@ -6,9 +6,11 @@ import urlJoin from 'url-join';
@@ -269,18 +113,26 @@ index 74564c56f..0dc14d3c7 100644
  import { parseBrowserLanguage } from '@/utils/locale';
  import { RouteVariants } from '@/utils/server/routeVariants';
  
-@@ -231,6 +233,58 @@ export function defineConfig() {
+@@ -18,6 +20,7 @@ import { createRouteMatcher } from './createRouteMatcher';
+ // Create debug logger instances
+ const logDefault = debug('middleware:default');
+ const logBetterAuth = debug('middleware:better-auth');
++const logTokenAuth = debug('middleware:token-auth');
+ 
+ // Dev-only debug proxy route should bypass all middleware rewrites.
+ const dangerousLocalDevProxyRoute = '/_dangerous_local_dev_proxy';
+@@ -231,6 +234,58 @@ export function defineConfig() {
  
      const isLoggedIn = !!session?.user;
  
 +    if (!isLoggedIn) {
 +      // Check if token authentication is enabled
 +      if (!TokenAuthService.isTokenAuthEnabled()) {
-+        logBetterAuth('Token authentication is not enabled, skipping');
++        logTokenAuth('Token authentication is not enabled, skipping');
 +      } else {
 +        const cookieHeader = req.headers.get('cookie');
 +        const cookieToken = TokenAuthService.extractTokenFromCookie(cookieHeader);
-+        logBetterAuth('Token authentication cookie: %s', cookieToken);
++        logTokenAuth('Token authentication cookie: %s', cookieToken);
 +        if (cookieToken) {
 +          try {
 +            const clientIp = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
@@ -300,7 +152,7 @@ index 74564c56f..0dc14d3c7 100644
 +            if (tokenAuthResult) {
 +              const { userId, sessionToken } = tokenAuthResult;
 +
-+              logBetterAuth('Token authentication successful for user: %s', userId);
++              logTokenAuth('Token authentication successful for user: %s', userId);
 +
 +              // Set the session cookie in the response
 +              // Better Auth uses 'better-auth.session_token' as the default cookie name
@@ -313,13 +165,13 @@ index 74564c56f..0dc14d3c7 100644
 +                maxAge: 60 * 60 * 24 * 7, // 7 days
 +              });
 +
-+              logBetterAuth('Session cookie set for user: %s', userId);
++              logTokenAuth('Session cookie set for user: %s', userId);
 +
 +              // Allow access by returning the response with session cookie
 +              return response;
 +            }
 +          } catch (tokenError) {
-+            logBetterAuth('Token authentication failed: %O', tokenError);
++            logTokenAuth('Token authentication failed: %O', tokenError);
 +          }
 +        }
 +      }
@@ -330,10 +182,10 @@ index 74564c56f..0dc14d3c7 100644
        userId: session?.user?.id,
 diff --git a/src/services/tokenAuth/index.ts b/src/services/tokenAuth/index.ts
 new file mode 100644
-index 000000000..a8f2ccfa5
+index 000000000..29d16a800
 --- /dev/null
 +++ b/src/services/tokenAuth/index.ts
-@@ -0,0 +1,298 @@
+@@ -0,0 +1,404 @@
 +import type { LobeChatDatabase } from '@lobechat/database';
 +import { createNanoId, idGenerator } from '@lobechat/database';
 +import { session, users } from '@lobechat/database/schemas';
@@ -341,6 +193,8 @@ index 000000000..a8f2ccfa5
 +import { eq } from 'drizzle-orm';
 +
 +import { authEnv } from '@/envs/auth';
++import { getRedisConfig } from '@/envs/redis';
++import { initializeRedis, isRedisEnabled } from '@/libs/redis';
 +import { UserService } from '@/server/services/user';
 +
 +const log = debug('middleware:token-auth');
@@ -494,11 +348,21 @@ index 000000000..a8f2ccfa5
 +    try {
 +      log('Verifying token with external API: %s', verifyUrl);
 +      const tokenKey = TokenAuthService.getTokenCookieKey();
++      
++      // Add timeout to prevent hanging
++      const controller = new AbortController();
++      const timeoutId = setTimeout(() => {
++        controller.abort();
++      }, 10000); // 10 seconds timeout
++
 +      const response = await fetch(verifyUrl, {
 +        headers: {
 +          Cookie: `${tokenKey}=${token}`,
 +        },
++        signal: controller.signal,
 +      });
++
++      clearTimeout(timeoutId);
 +
 +      if (!response.ok) {
 +        log('Token verification failed with status: %d', response.status);
@@ -510,7 +374,23 @@ index 000000000..a8f2ccfa5
 +
 +      return this.extractUserInfoFromResponse(responseData);
 +    } catch (error) {
-+      log('Token verification error: %O', error);
++      // Handle different types of errors
++      if (error instanceof Error) {
++        if (error.name === 'AbortError') {
++          log('Token verification timed out');
++        } else if (error.cause && typeof error.cause === 'object' && 'code' in error.cause) {
++          const code = (error.cause as Record<string, unknown>).code;
++          if (code === 'ECONNREFUSED') {
++            log('Token verification failed: Connection refused to %s', verifyUrl);
++          } else {
++            log('Token verification network error: %s - %s', code, error.message);
++          }
++        } else {
++          log('Token verification error: %s', error.message);
++        }
++      } else {
++        log('Token verification error: %O', error);
++      }
 +      return null;
 +    }
 +  }
@@ -573,6 +453,66 @@ index 000000000..a8f2ccfa5
 +  }
 +
 +  /**
++   * Get the user data for session caching
++   */
++  private async getUserForSession(userId: string): Promise<Record<string, unknown> | null> {
++    try {
++      const user = await this.db.query.users.findFirst({
++        where: eq(users.id, userId),
++      });
++
++      if (!user) {
++        log('User not found for session: %s', userId);
++        return null;
++      }
++
++      return {
++        id: user.id,
++        email: user.email || null,
++        fullName: user.fullName || null,
++        emailVerified: user.emailVerified,
++        createdAt: user.createdAt.toISOString(),
++        updatedAt: user.updatedAt.toISOString(),
++      };
++    } catch (error) {
++      log('Error fetching user for session: %O', error);
++      return null;
++    }
++  }
++
++  /**
++   * Update Redis cache with session data
++   */
++  private async updateSessionCache(
++    sessionToken: string,
++    sessionData: Record<string, unknown>,
++    ttl: number,
++  ): Promise<void> {
++    const redisConfig = getRedisConfig();
++    if (!isRedisEnabled(redisConfig)) {
++      log('Redis is not enabled, skipping session cache update');
++      return;
++    }
++
++    try {
++      const redisClient = await initializeRedis(redisConfig);
++      if (!redisClient) {
++        log('Failed to initialize Redis client');
++        return;
++      }
++
++      const key = `better-auth:session:${sessionToken}`;
++      const value = JSON.stringify(sessionData);
++
++      await redisClient.set(key, value, { ex: ttl });
++      log('Updated Redis session cache for token: %s', sessionToken);
++    } catch (error) {
++      log('Error updating session cache: %O', error);
++      // Don't fail the entire operation if Redis is unavailable
++    }
++  }
++
++  /**
 +   * Create a Better Auth session for the user
 +   */
 +  private async createSession(userId: string, ipAddress?: string, userAgent?: string): Promise<string> {
@@ -596,6 +536,24 @@ index 000000000..a8f2ccfa5
 +      createdAt: now,
 +      updatedAt: now,
 +    });
++
++    // Get user data for session cache
++    const userData = await this.getUserForSession(userId);
++    if (userData) {
++      // Build session data in the format Better Auth expects
++      const sessionData = {
++        id: sessionId,
++        userId,
++        expiresAt: expiresAt.toISOString(),
++        ipAddress,
++        userAgent,
++        user: userData,
++      };
++
++      // Calculate TTL in seconds (7 days)
++      const ttl = 7 * 24 * 60 * 60;
++      await this.updateSessionCache(sessionToken, sessionData, ttl);
++    }
 +
 +    return sessionToken;
 +  }
