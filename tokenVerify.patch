@@ -1,5 +1,5 @@
 diff --git a/apps/server/src/globalConfig/index.ts b/apps/server/src/globalConfig/index.ts
-index 17df96cae..e2964231f 100644
+index 856bf3104..7f4f1ca64 100644
 --- a/apps/server/src/globalConfig/index.ts
 +++ b/apps/server/src/globalConfig/index.ts
 @@ -47,7 +47,7 @@ export const getServerGlobalConfig = async () => {
@@ -97,8 +97,74 @@ index 422fe85c8..4c85614c3 100644
      },
    });
  };
+diff --git a/packages/trpc/src/lambda/context.ts b/packages/trpc/src/lambda/context.ts
+index f52dfa533..6fc8f5ee1 100644
+--- a/packages/trpc/src/lambda/context.ts
++++ b/packages/trpc/src/lambda/context.ts
+@@ -11,6 +11,7 @@ import { authEnv, LOBE_CHAT_OIDC_AUTH_HEADER } from '@/envs/auth';
+ import { extractTraceContext } from '@/libs/observability/traceparent';
+ import { assertOIDCUserActive, isOIDCUserInactiveError } from '@/libs/oidc-provider/access-control';
+ import { validateOIDCJWT } from '@/libs/oidc-provider/jwt';
++import { TokenAuthService } from '@/services/tokenAuth';
+ import { isApiKeyExpired, validateApiKeyFormat } from '@/utils/apiKey';
+ 
+ // Create context logger namespace
+@@ -242,16 +243,48 @@ export const createLambdaContext = async (request: NextRequest): Promise<LambdaC
+       log('Better Auth authentication failed, no valid session');
+     }
+ 
+-    return createContextInner({
+-      ...commonContext,
+-      traceContext,
+-      userId,
+-    });
++    if (userId) {
++      return createContextInner({
++        ...commonContext,
++        traceContext,
++        userId,
++      });
++    }
+   } catch (e) {
+     log('Better Auth authentication error: %O', e);
+     console.error('better auth err', e);
+   }
+ 
++  // If Better Auth authentication failed, try token cookie authentication
++  log('Attempting token cookie authentication');
++  try {
++    if (!TokenAuthService.isTokenAuthEnabled()) {
++      log('Token authentication is not enabled, skipping');
++    } else {
++      const cookieHeader = request.headers.get('cookie');
++      const cookieToken = TokenAuthService.extractTokenFromCookie(cookieHeader);
++      log('Token authentication cookie: %s', cookieToken);
++
++      if (cookieToken) {
++        const db = await getServerDB();
++        const tokenAuthService = new TokenAuthService(db);
++        const tokenAuthResult = await tokenAuthService.authenticateWithToken(
++          cookieToken,
++          clientIp,
++          userAgent,
++        );
++
++        if (tokenAuthResult) {
++          userId = tokenAuthResult.userId;
++          log('Token cookie authentication successful, userId: %s', userId);
++        }
++      }
++    }
++  } catch (e) {
++    log('Token cookie authentication error: %O', e);
++    console.error('token auth err', e);
++  }
++
+   // Final return, userId may be undefined
+   log(
+     'All authentication methods attempted, returning final context, userId: %s',
 diff --git a/src/libs/next/proxy/define-config.ts b/src/libs/next/proxy/define-config.ts
-index 74564c56f..27af0d7b7 100644
+index 1471ae082..725b95b9f 100644
 --- a/src/libs/next/proxy/define-config.ts
 +++ b/src/libs/next/proxy/define-config.ts
 @@ -6,9 +6,11 @@ import urlJoin from 'url-join';
@@ -111,7 +177,7 @@ index 74564c56f..27af0d7b7 100644
  import { type Locales } from '@/locales/resources';
 +import { TokenAuthService } from '@/services/tokenAuth';
  import { parseBrowserLanguage } from '@/utils/locale';
- import { RouteVariants } from '@/utils/server/routeVariants';
+ import { DEFAULT_LANG, locales, RouteVariants } from '@/utils/server/routeVariants';
  
 @@ -18,6 +20,7 @@ import { createRouteMatcher } from './createRouteMatcher';
  // Create debug logger instances
@@ -121,7 +187,7 @@ index 74564c56f..27af0d7b7 100644
  
  // Dev-only debug proxy route should bypass all middleware rewrites.
  const dangerousLocalDevProxyRoute = '/_dangerous_local_dev_proxy';
-@@ -231,6 +234,58 @@ export function defineConfig() {
+@@ -243,6 +246,58 @@ export function defineConfig() {
  
      const isLoggedIn = !!session?.user;
  
@@ -182,10 +248,10 @@ index 74564c56f..27af0d7b7 100644
        userId: session?.user?.id,
 diff --git a/src/services/tokenAuth/index.ts b/src/services/tokenAuth/index.ts
 new file mode 100644
-index 000000000..29d16a800
+index 000000000..966c70ca0
 --- /dev/null
 +++ b/src/services/tokenAuth/index.ts
-@@ -0,0 +1,404 @@
+@@ -0,0 +1,448 @@
 +import type { LobeChatDatabase } from '@lobechat/database';
 +import { createNanoId, idGenerator } from '@lobechat/database';
 +import { session, users } from '@lobechat/database/schemas';
@@ -238,10 +304,17 @@ index 000000000..29d16a800
 +}
 +
 +/**
-+ * Result of token authentication
-+ */
++   * Result of token authentication
++   */
 +interface TokenAuthResult {
 +  sessionToken: string;
++  userId: string;
++}
++
++/**
++ * Result of session validation
++ */
++interface SessionValidationResult {
 +  userId: string;
 +}
 +
@@ -348,7 +421,7 @@ index 000000000..29d16a800
 +    try {
 +      log('Verifying token with external API: %s', verifyUrl);
 +      const tokenKey = TokenAuthService.getTokenCookieKey();
-+      
++
 +      // Add timeout to prevent hanging
 +      const controller = new AbortController();
 +      const timeoutId = setTimeout(() => {
@@ -571,7 +644,17 @@ index 000000000..29d16a800
 +    ipAddress?: string,
 +    userAgent?: string,
 +  ): Promise<TokenAuthResult | null> {
-+    // Verify token with external API
++    // First, try to validate if this token is already a valid session token
++    const existingSession = await this.validateSessionToken(token);
++    if (existingSession) {
++      log('Token is already a valid session token, userId: %s', existingSession.userId);
++      return {
++        sessionToken: token,
++        userId: existingSession.userId,
++      };
++    }
++
++    // If not a session token, verify with external API
 +    const userInfo = await this.verifyTokenWithExternalApi(token);
 +    if (!userInfo) {
 +      log('Token verification returned no user info');
@@ -588,6 +671,33 @@ index 000000000..29d16a800
 +      sessionToken,
 +      userId,
 +    };
++  }
++
++  /**
++   * Validate an existing session token by checking the database
++   *
++   * @param sessionToken - The session token to validate
++   * @returns SessionValidationResult with user ID if valid, null otherwise
++   */
++  async validateSessionToken(sessionToken: string): Promise<SessionValidationResult | null> {
++    try {
++      const now = new Date();
++      const sessionRecord = await this.db.query.session.findFirst({
++        where: (session, { and, eq, gt }) =>
++          and(eq(session.token, sessionToken), gt(session.expiresAt, now)),
++      });
++
++      if (sessionRecord) {
++        log('Session token validated successfully, userId: %s', sessionRecord.userId);
++        return { userId: sessionRecord.userId };
++      }
++
++      log('Session token not found or expired');
++      return null;
++    } catch (error) {
++      log('Error validating session token: %O', error);
++      return null;
++    }
 +  }
 +}
 \ No newline at end of file
