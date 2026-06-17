@@ -9,9 +9,12 @@ import type {
   DeviceGitAheadBehind,
   DeviceGitBranchListItem,
   DeviceGitCheckoutResult,
+  DeviceGitDeleteBranchResult,
   DeviceGitLinkedPullRequest,
+  DeviceGitRenameBranchResult,
   DeviceGitSyncResult,
   DeviceGitWorkingTreeStatus,
+  DeviceGitWorktreeListItem,
 } from '@lobechat/types';
 
 import { lambdaClient } from '@/libs/trpc/client';
@@ -62,6 +65,38 @@ class GitService {
     return deviceId
       ? lambdaClient.device.checkoutGitBranch.mutate({ branch, create, deviceId, path })
       : electronGitService.checkoutGitBranch({ branch, create, path });
+  }
+
+  /** Rename a branch in a working directory. */
+  renameGitBranch({
+    deviceId,
+    from,
+    path,
+    to,
+  }: {
+    deviceId?: string;
+    from: string;
+    path: string;
+    to: string;
+  }): Promise<DeviceGitRenameBranchResult> {
+    return deviceId
+      ? lambdaClient.device.renameGitBranch.mutate({ deviceId, from, path, to })
+      : electronGitService.renameGitBranch({ from, path, to });
+  }
+
+  /** Delete a branch in a working directory. */
+  deleteGitBranch({
+    branch,
+    deviceId,
+    path,
+  }: {
+    branch: string;
+    deviceId?: string;
+    path: string;
+  }): Promise<DeviceGitDeleteBranchResult> {
+    return deviceId
+      ? lambdaClient.device.deleteGitBranch.mutate({ branch, deviceId, path })
+      : electronGitService.deleteGitBranch({ branch, path });
   }
 
   /** Pull (`--ff-only`) the current branch of a working directory. */
@@ -208,6 +243,19 @@ class GitService {
     return deviceId
       ? lambdaClient.device.listGitRemoteBranches.query({ deviceId, path })
       : electronGitService.listGitRemoteBranches(path);
+  }
+
+  /** Git worktrees attached to the same repository as a working directory. */
+  listGitWorktrees({
+    deviceId,
+    path,
+  }: {
+    deviceId?: string;
+    path: string;
+  }): Promise<DeviceGitWorktreeListItem[]> {
+    return deviceId
+      ? lambdaClient.device.listGitWorktrees.query({ deviceId, path })
+      : electronGitService.listGitWorktrees(path);
   }
 
   /** Revert (discard working-tree changes to) a single file in a working directory. */

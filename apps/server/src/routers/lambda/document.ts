@@ -183,6 +183,7 @@ export const documentRouter = router({
         input.documentId,
         editorData,
         input.saveSource,
+        input.lockOwnerId,
       );
     }),
 
@@ -251,6 +252,31 @@ export const documentRouter = router({
     )
     .query(async ({ ctx, input }) => {
       return ctx.documentService.queryDocuments(input);
+    }),
+
+  acquireDocumentLock: documentProcedure
+    .use(withScopedPermission('document:update'))
+    .input(z.object({ id: z.string(), ownerId: z.string().optional() }))
+    .mutation(async ({ ctx, input }) => {
+      return input.ownerId
+        ? ctx.documentService.acquireDocumentLockWithOwner(input.id, input.ownerId)
+        : ctx.documentService.acquireDocumentLock(input.id);
+    }),
+
+  getDocumentLock: documentProcedure
+    .use(withScopedPermission('document:update'))
+    .input(z.object({ id: z.string(), ownerId: z.string().optional() }))
+    .query(async ({ ctx, input }) => {
+      return ctx.documentService.getDocumentLock(input.id, input.ownerId);
+    }),
+
+  releaseDocumentLock: documentProcedure
+    .use(withScopedPermission('document:update'))
+    .input(z.object({ id: z.string(), ownerId: z.string().optional() }))
+    .mutation(async ({ ctx, input }) => {
+      if (input.ownerId)
+        await ctx.documentService.releaseDocumentLockWithOwner(input.id, input.ownerId);
+      else await ctx.documentService.releaseDocumentLock(input.id);
     }),
 
   updateDocument: documentProcedure

@@ -108,6 +108,23 @@ export default {
   'pageEditor.duplicateSuccess': 'Page duplicated successfully',
   'pageEditor.editedAt': 'Last edited on {{time}}',
   'pageEditor.editedBy': 'Last edited by {{name}}',
+  'pageEditor.editMode.checking': 'Checking edit availability…',
+  'pageEditor.editMode.draftRestoreCancel': 'Discard',
+  'pageEditor.editMode.draftRestoreContent':
+    'Found unsaved local changes from your last session. Restore them?',
+  'pageEditor.editMode.draftRestoreOk': 'Restore',
+  'pageEditor.editMode.draftRestoreTitle': 'Restore Unsaved Draft',
+  'pageEditor.editMode.lockedByOther': '{{name}} is editing this document',
+  'pageEditor.editMode.lockedBySelf': 'You’re editing this document in another tab',
+  'pageEditor.editMode.lockedBySelfDescription':
+    'Saves will resume after the other session closes or its lock expires (~30s).',
+  'pageEditor.editMode.lockedBySomeone': 'Someone else is editing this document',
+  'pageEditor.editMode.lockedDescription':
+    'The page is read-only while they edit. Your changes won’t be saved until they’re done.',
+  'pageEditor.editMode.lockLostDescription':
+    'Recent edits haven’t synced yet. They’ll resume saving once the connection recovers.',
+  'pageEditor.editMode.lockLostTitle': 'Edit lock temporarily lost',
+  'pageEditor.editMode.lockUnstable': 'Reconnecting edit lock…',
   'pageEditor.editorPlaceholder': 'Press "/" for AI and commands.',
   'pageEditor.empty.createNewDocument': 'Create New Page',
   'pageEditor.empty.importNotion': 'Import from Notion',
@@ -146,6 +163,10 @@ export default {
   'pageEditor.history.versionCount_other': '{{count}} versions',
 
   'pageEditor.linkCopied': 'Link copied',
+  'pageEditor.lock.editingByOther':
+    '{{name}} is editing this page. Your changes can’t be saved right now.',
+  'pageEditor.lock.editingBySomeone':
+    'Someone else is editing this page. Your changes can’t be saved right now.',
   'pageEditor.menu.copyLink': 'Copy Link',
   'pageEditor.menu.export': 'Export',
   'pageEditor.menu.export.markdown': 'Markdown',

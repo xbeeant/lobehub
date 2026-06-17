@@ -111,7 +111,15 @@ export interface AuditSafePathsResult {
   allSafe: boolean;
 }
 
+export type LocalFilePreviewAccept = 'image';
+
 export interface LocalFilePreviewUrlParams {
+  accept?: LocalFilePreviewAccept;
+  /**
+   * Allows previewing one user-selected file outside approved workspace roots.
+   * This is only for renderer previews and must not expand agent file access.
+   */
+  allowExternalFile?: boolean;
   path: string;
   workingDirectory: string;
 }

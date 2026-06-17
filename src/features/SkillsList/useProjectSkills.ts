@@ -1,14 +1,22 @@
 import { type ListProjectSkillsResult, type ProjectSkillItem } from '@lobechat/electron-client-ipc';
+import { EyeIcon, PencilIcon, Trash2Icon } from 'lucide-react';
 import path from 'pathe';
 import { useMemo } from 'react';
+import { useTranslation } from 'react-i18next';
 
-import { useClientDataSWR } from '@/libs/swr';
-import { projectSkillService } from '@/services/projectSkill';
+import { useFetchProjectSkills } from '@/hooks/useFetchProjectSkills';
 import { useChatStore } from '@/store/chat';
 
-import type { SkillListItem } from './SkillsList';
+import type { SkillListItem, SkillRowAction } from './SkillsList';
 
 export interface UseProjectSkillsResult {
+  /**
+   * Per-row actions for project skills: "view" opens the SKILL.md (local only —
+   * a remote device's filesystem isn't reachable by the local viewer), while
+   * rename / delete are stubbed (disabled) until the filesystem-mutation IPC
+   * lands.
+   */
+  getRowActions: (item: SkillListItem) => SkillRowAction[];
   isLoading: boolean;
   items: SkillListItem[];
   onOpenFile: (item: SkillListItem, relativePath: string) => void;
@@ -33,14 +41,11 @@ export const useProjectSkills = (
   workingDirectory: string | undefined,
   deviceId?: string,
 ): UseProjectSkillsResult => {
+  const { t } = useTranslation('chat');
   const openLocalFile = useChatStore((s) => s.openLocalFile);
   const isRemote = !!deviceId;
 
-  const { data, isLoading } = useClientDataSWR<ListProjectSkillsResult | undefined>(
-    workingDirectory ? ['project-skills', deviceId ?? 'local', workingDirectory] : null,
-    () => projectSkillService.listProjectSkills({ deviceId, scope: workingDirectory! }),
-    { revalidateOnFocus: false, shouldRetryOnError: false },
-  );
+  const { data, isLoading } = useFetchProjectSkills(workingDirectory, deviceId);
 
   // listProjectSkills approves `data.root` for preview. Hand that exact value
   // back to openLocalFile so LocalFileProtocolManager.createPreviewUrl's
@@ -85,5 +90,37 @@ export const useProjectSkills = (
     openLocalFile({ filePath: skill.path, workingDirectory: previewRoot });
   };
 
-  return { isLoading, items, onOpenFile, onOpenSkill, raw: data };
+  const getRowActions = (_item: SkillListItem): SkillRowAction[] => {
+    const comingSoon = t('workingPanel.skills.actions.comingSoon');
+    return [
+      {
+        // Remote devices list skills but can't preview them (matches Files tab).
+        disabled: isRemote,
+        icon: EyeIcon,
+        key: 'view',
+        label: t('workingPanel.skills.actions.view'),
+        onClick: onOpenSkill,
+      },
+      {
+        // Renaming a filesystem skill needs an IPC/RPC that doesn't exist yet.
+        disabled: true,
+        icon: PencilIcon,
+        key: 'rename',
+        label: t('workingPanel.skills.actions.rename'),
+        onClick: () => {},
+        tooltip: comingSoon,
+      },
+      {
+        danger: true,
+        disabled: true,
+        icon: Trash2Icon,
+        key: 'delete',
+        label: t('workingPanel.skills.actions.delete'),
+        onClick: () => {},
+        tooltip: comingSoon,
+      },
+    ];
+  };
+
+  return { getRowActions, isLoading, items, onOpenFile, onOpenSkill, raw: data };
 };

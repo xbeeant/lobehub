@@ -718,7 +718,37 @@ describe('DeviceGateway', () => {
         { deviceId: 'dev-1', timeout: 30_000, userId: 'user-1' },
         {
           method: 'getLocalFilePreview',
-          params: { path: '/proj/App.tsx', workingDirectory: '/proj' },
+          params: { accept: undefined, path: '/proj/App.tsx', workingDirectory: '/proj' },
+        },
+      );
+    });
+
+    it('forwards image-only preview constraints to the device rpc', async () => {
+      configure();
+      const data = {
+        preview: {
+          base64: 'aW1hZ2U=',
+          contentType: 'image/png',
+          type: 'image',
+        },
+        success: true,
+      };
+      mockClient.invokeRpc.mockResolvedValue({ data, success: true });
+
+      const proxy = new DeviceGateway();
+      await proxy.getLocalFilePreview({
+        accept: 'image',
+        deviceId: 'dev-1',
+        path: '/proj/image.png',
+        userId: 'user-1',
+        workingDirectory: '/proj',
+      });
+
+      expect(mockClient.invokeRpc).toHaveBeenCalledWith(
+        { deviceId: 'dev-1', timeout: 30_000, userId: 'user-1' },
+        {
+          method: 'getLocalFilePreview',
+          params: { accept: 'image', path: '/proj/image.png', workingDirectory: '/proj' },
         },
       );
     });
@@ -736,6 +766,148 @@ describe('DeviceGateway', () => {
       });
 
       expect(result).toEqual({ error: 'offline', success: false });
+    });
+  });
+
+  describe('file mutation containment', () => {
+    const configure = () => {
+      mockEnv.DEVICE_GATEWAY_URL = 'https://gateway.example.com';
+      mockEnv.DEVICE_GATEWAY_SERVICE_TOKEN = 'token';
+    };
+
+    describe('writeProjectFile', () => {
+      it('invokes the rpc when the path is inside the workspace', async () => {
+        configure();
+        mockClient.invokeRpc.mockResolvedValue({ data: { success: true }, success: true });
+
+        const proxy = new DeviceGateway();
+        const result = await proxy.writeProjectFile({
+          content: 'next',
+          deviceId: 'dev-1',
+          path: '/proj/src/App.tsx',
+          userId: 'user-1',
+          workingDirectory: '/proj',
+        });
+
+        expect(result).toEqual({ success: true });
+        expect(mockClient.invokeRpc).toHaveBeenCalledWith(
+          { deviceId: 'dev-1', timeout: 30_000, userId: 'user-1' },
+          { method: 'writeLocalFile', params: { content: 'next', path: '/proj/src/App.tsx' } },
+        );
+      });
+
+      it('throws without invoking the rpc when the path escapes the workspace', async () => {
+        configure();
+        const proxy = new DeviceGateway();
+
+        await expect(
+          proxy.writeProjectFile({
+            content: 'pwned',
+            deviceId: 'dev-1',
+            path: '/etc/passwd',
+            userId: 'user-1',
+            workingDirectory: '/proj',
+          }),
+        ).rejects.toThrow(/outside the approved workspace/);
+        expect(mockClient.invokeRpc).not.toHaveBeenCalled();
+      });
+
+      it('rejects a `..` traversal that resolves outside the workspace', async () => {
+        configure();
+        const proxy = new DeviceGateway();
+
+        await expect(
+          proxy.writeProjectFile({
+            content: 'pwned',
+            deviceId: 'dev-1',
+            path: '/proj/../secrets.env',
+            userId: 'user-1',
+            workingDirectory: '/proj',
+          }),
+        ).rejects.toThrow(/outside the approved workspace/);
+        expect(mockClient.invokeRpc).not.toHaveBeenCalled();
+      });
+
+      it('contains Windows device paths using Windows path semantics', async () => {
+        configure();
+        const proxy = new DeviceGateway();
+
+        await expect(
+          proxy.writeProjectFile({
+            content: 'pwned',
+            deviceId: 'dev-1',
+            path: 'C:\\Windows\\System32\\drivers\\etc\\hosts',
+            userId: 'user-1',
+            workingDirectory: 'C:\\proj',
+          }),
+        ).rejects.toThrow(/outside the approved workspace/);
+        expect(mockClient.invokeRpc).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('renameProjectFile', () => {
+      it('throws without invoking the rpc when the path escapes the workspace', async () => {
+        configure();
+        const proxy = new DeviceGateway();
+
+        await expect(
+          proxy.renameProjectFile({
+            deviceId: 'dev-1',
+            newName: 'evil.ts',
+            path: '/etc/hosts',
+            userId: 'user-1',
+            workingDirectory: '/proj',
+          }),
+        ).rejects.toThrow(/outside the approved workspace/);
+        expect(mockClient.invokeRpc).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('moveProjectFiles', () => {
+      it('throws when any item moves out of the workspace', async () => {
+        configure();
+        const proxy = new DeviceGateway();
+
+        await expect(
+          proxy.moveProjectFiles({
+            deviceId: 'dev-1',
+            items: [
+              { newPath: '/proj/b.ts', oldPath: '/proj/a.ts' },
+              { newPath: '/tmp/exfil.ts', oldPath: '/proj/c.ts' },
+            ],
+            userId: 'user-1',
+            workingDirectory: '/proj',
+          }),
+        ).rejects.toThrow(/outside the approved workspace/);
+        expect(mockClient.invokeRpc).not.toHaveBeenCalled();
+      });
+
+      it('invokes the rpc when every item stays inside the workspace', async () => {
+        configure();
+        mockClient.invokeRpc.mockResolvedValue({
+          data: [{ newPath: '/proj/b.ts', sourcePath: '/proj/a.ts', success: true }],
+          success: true,
+        });
+
+        const proxy = new DeviceGateway();
+        const result = await proxy.moveProjectFiles({
+          deviceId: 'dev-1',
+          items: [{ newPath: '/proj/b.ts', oldPath: '/proj/a.ts' }],
+          userId: 'user-1',
+          workingDirectory: '/proj',
+        });
+
+        expect(result).toEqual([
+          { newPath: '/proj/b.ts', sourcePath: '/proj/a.ts', success: true },
+        ]);
+        expect(mockClient.invokeRpc).toHaveBeenCalledWith(
+          { deviceId: 'dev-1', timeout: 30_000, userId: 'user-1' },
+          {
+            method: 'moveLocalFiles',
+            params: { items: [{ newPath: '/proj/b.ts', oldPath: '/proj/a.ts' }] },
+          },
+        );
+      });
     });
   });
 

@@ -14,6 +14,7 @@ import { useHeteroAgentCloudConfig } from '@/business/client/hooks/useHeteroAgen
 import { isDesktop } from '@/const/version';
 import { type ActionKeys } from '@/features/ChatInput';
 import { ChatInput } from '@/features/Conversation';
+import { contextSelectors, useConversationStore } from '@/features/Conversation/store';
 import WideScreenContainer from '@/features/WideScreenContainer';
 import { resolveExecutionTarget } from '@/helpers/executionTarget';
 import { useRemoteAgentDeviceGuard } from '@/hooks/useRemoteAgentDeviceGuard';
@@ -41,11 +42,18 @@ const rightActions: ActionKeys[] = [];
  */
 const HeterogeneousChatInput = memo(() => {
   const { t } = useTranslation('chat');
-  const { isConfigured, goToConfig } = useHeteroAgentCloudConfig();
+  // Scope every hetero check to the conversation's agent. Passing `agentId`
+  // into the cloud-credential and device guards keeps them validating the same
+  // agent that `agencyConfig`/`isDeviceExecution` are computed from, instead of
+  // the global (hijack-prone) active agent.
+  const agentId = useConversationStore(contextSelectors.agentId);
+  const { isConfigured, goToConfig } = useHeteroAgentCloudConfig(agentId);
   const params = useParams<{ aid: string }>();
   const navigate = useNavigate();
 
-  const agencyConfig = useAgentStore((s) => agentSelectors.currentAgentConfig(s)?.agencyConfig);
+  const agencyConfig = useAgentStore(
+    (s) => agentSelectors.getAgentConfigById(agentId)(s)?.agencyConfig,
+  );
   const providerType = agencyConfig?.heterogeneousProvider?.type;
   const executionTarget = resolveExecutionTarget(agencyConfig, {
     isDesktop,
@@ -61,7 +69,7 @@ const HeterogeneousChatInput = memo(() => {
   const isDeviceExecution =
     isRemoteAgent || (executionTarget === 'device' && !!agencyConfig?.boundDeviceId);
 
-  const { status, refresh } = useRemoteAgentDeviceGuard({ enabled: isDeviceExecution });
+  const { status, refresh } = useRemoteAgentDeviceGuard({ agentId, enabled: isDeviceExecution });
 
   const goToAgentProfile = () => {
     if (params.aid) navigate(urlJoin('/agent', params.aid, 'profile'));
@@ -92,13 +100,14 @@ const HeterogeneousChatInput = memo(() => {
     }
 
     return (
-      <Flexbox paddingBlock={'0 6px'} paddingInline={12}>
-        <Alert
-          title={title}
-          type={'warning'}
-          description={
-            <Flexbox horizontal align={'center'} gap={8} justify={'space-between'}>
-              <span>{desc}</span>
+      <WideScreenContainer>
+        <Flexbox align={'center'} paddingBlock={'0 8px'} paddingInline={12}>
+          <Alert
+            description={desc}
+            style={{ maxWidth: 880, width: '100%' }}
+            title={title}
+            type={'warning'}
+            action={
               <Flexbox horizontal gap={6}>
                 <Button size={'small'} onClick={refresh}>
                   {t('platformAgent.deviceGuard.refresh')}
@@ -107,44 +116,50 @@ const HeterogeneousChatInput = memo(() => {
                   {t('platformAgent.deviceGuard.configure')}
                 </Button>
               </Flexbox>
-            </Flexbox>
-          }
-        />
-      </Flexbox>
+            }
+          />
+        </Flexbox>
+      </WideScreenContainer>
+    );
+  };
+
+  const renderCloudConfigGuard = () => {
+    if (isDeviceExecution || isConfigured) return null;
+
+    return (
+      <WideScreenContainer>
+        <Flexbox align={'center'} paddingBlock={'0 8px'} paddingInline={12}>
+          <Alert
+            description={t('heteroAgent.cloudNotConfigured.desc')}
+            style={{ maxWidth: 880, width: '100%' }}
+            title={t('heteroAgent.cloudNotConfigured.title')}
+            type={'warning'}
+            action={
+              <Button size={'small'} type={'primary'} onClick={goToConfig}>
+                {t('heteroAgent.cloudNotConfigured.action')}
+              </Button>
+            }
+          />
+        </Flexbox>
+      </WideScreenContainer>
     );
   };
 
   // Device execution doesn't use the cloud sandbox, so it doesn't need cloud
   // credentials — only the sandbox path gates on `isConfigured`.
   const inputDisabled = (!isConfigured && !isDeviceExecution) || deviceBlocked;
+  const hasGuard = deviceBlocked || (!isConfigured && !isDeviceExecution);
 
   return (
     <Flexbox>
-      {!isDeviceExecution && !isConfigured && (
-        <WideScreenContainer>
-          <Flexbox paddingBlock={'0 6px'} paddingInline={12}>
-            <Alert
-              title={t('heteroAgent.cloudNotConfigured.title')}
-              type={'warning'}
-              description={
-                <Flexbox horizontal align={'center'} gap={8} justify={'space-between'}>
-                  <span>{t('heteroAgent.cloudNotConfigured.desc')}</span>
-                  <Button size={'small'} type={'primary'} onClick={goToConfig}>
-                    {t('heteroAgent.cloudNotConfigured.action')}
-                  </Button>
-                </Flexbox>
-              }
-            />
-          </Flexbox>
-        </WideScreenContainer>
-      )}
+      {renderCloudConfigGuard()}
       {renderDeviceGuard()}
       <ChatInput
-        skipScrollMarginWithList
         controlBarSlot={<HeteroControlBar />}
         leftActions={leftActions}
         rightActions={rightActions}
         sendButtonProps={{ disabled: inputDisabled, shape: 'round' }}
+        skipScrollMarginWithList={!hasGuard}
         onEditorReady={(instance) => {
           // Sync to global ChatStore for compatibility with other features
           useChatStore.setState({ mainInputEditor: instance });
